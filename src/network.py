@@ -10,7 +10,7 @@ from jax.tree_util import tree_map
 import random
 from numpy.typing import NDArray
 
-from .neat import Genome, prune_nonfunctional
+from .neat import Genome
 
 # Define a type variable for numeric types
 Number = TypeVar("Number", float, int)
@@ -18,9 +18,7 @@ WeightsDict = Dict[Tuple[int, int], Union[jnp.ndarray, NDArray, Number]]
 
 
 class Network:
-    def __init__(
-        self, genome: Genome, learning_rate: float = 0.05, debug: bool = False
-    ):
+    def __init__(self, genome: Genome, learning_rate: float = 0.1):
         self.genome = genome
         self.initial_learning_rate = learning_rate
         self.learning_rate = learning_rate
@@ -52,16 +50,18 @@ class Network:
                 to_type = genome.nodes[conn.out_node].type
 
                 if from_type == "input" and to_type == "output":
-                    # Direct input->output connections: need larger weights
-                    scale = 2.0 / (n_input + n_output)
-                    init_weight = np.random.uniform(-2.0, 2.0) * scale
+                    # Direct input->output: use He initialization with scaling
+                    scale = np.sqrt(2.0 / n_input)
+                    init_weight = np.random.normal(0, scale)
                 elif from_type == "hidden" or to_type == "hidden":
-                    # Connections to/from hidden: standard Xavier
-                    scale = np.sqrt(6.0 / (n_input + n_output + n_hidden))
-                    init_weight = np.random.uniform(-1.0, 1.0) * scale
+                    # Hidden layer connections: use combination of He and Xavier
+                    fan_in = n_input if from_type == "input" else n_hidden
+                    fan_out = n_output if to_type == "output" else n_hidden
+                    scale = np.sqrt(4.0 / (fan_in + fan_out))
+                    init_weight = np.random.normal(0, scale)
                 else:
-                    # Default
-                    init_weight = conn.weight
+                    # Default with small random initialization
+                    init_weight = np.random.normal(0, 0.1)
 
                 # Ensure non-zero initialization to break symmetry
                 if abs(init_weight) < 0.01:
@@ -77,43 +77,32 @@ class Network:
         return inputs + hidden + outputs
 
     def _activate(self, x: jnp.ndarray, activation: str) -> jnp.ndarray:
-        """Apply activation function with extreme non-linearity for XOR."""
+        """Apply activation function with balanced non-linearity for general classification."""
         if activation == "sigmoid":
-            # Extreme sigmoid for XOR to push values far from 0.5
-            temp = 3.0  # Much higher temperature for sharper decision boundaries
-            return jax.nn.sigmoid(x * temp)
+            # Balanced sigmoid with moderate temperature for good gradients
+            return jax.nn.sigmoid(x * 1.5)
         elif activation == "relu":
-            # For XOR, plain ReLU often fails due to collapsing to a linear function
-            # Add a curvature component for non-linearity
-            sigmoid_component = jax.nn.sigmoid(x * 2.0) - 0.5  # -0.5 to 0.5 range
-            return (
-                jax.nn.relu(x) + sigmoid_component * 0.5
-            )  # Modified ReLU with sigmoid bent
+            # ReLU with slight bend to avoid dead neurons and improve gradients
+            small_bend = jax.nn.sigmoid(x) - 0.5
+            return jax.nn.relu(x) + small_bend * 0.2
         elif activation == "tanh":
-            # Very steep tanh for strong XOR discrimination
-            return jnp.tanh(x * 3.0)  # Much steeper slope for better decision boundary
+            # Standard tanh with slight scaling for better gradient flow
+            return jnp.tanh(x * 1.5)
         elif activation == "leaky_relu":
-            # Non-linear leaky ReLU with sigmoid bent
-            base = jax.nn.leaky_relu(x, negative_slope=0.25)
-            sigmoid_bend = jax.nn.sigmoid(x * 2.5) - 0.5
-            return base + sigmoid_bend * 0.4
+            # Leaky ReLU with balanced slope for better gradient flow
+            return jax.nn.leaky_relu(x, negative_slope=0.1)
         elif activation == "elu":
-            # Stronger ELU with extra non-linearity
-            base = jax.nn.elu(x * 2.0)
-            return base + 0.2 * jnp.tanh(x * 3.0)
-        elif activation == "softplus":
-            # Modified softplus with sharp transition
-            return jax.nn.softplus(x * 2.0) + 0.1 * jnp.tanh(x * 5.0)
+            # Standard ELU with slight scaling
+            return jax.nn.elu(x * 1.2)
         elif activation == "swish":
-            # Enhanced Swish with extra non-linearity - great for XOR
-            beta = 3.0  # Much steeper
-            return x * jax.nn.sigmoid(x * beta) + 0.1 * jnp.tanh(x * 4.0)
+            # Swish with balanced beta, good for deep networks
+            beta = 1.5
+            return x * jax.nn.sigmoid(x * beta)
         elif activation == "gelu":
-            # Enhanced GELU with extra non-linearity
-            return jax.nn.gelu(x * 2.0) + 0.15 * jnp.tanh(x * 3.0)
-        # For "linear" or any other activation, add strong non-linearity
-        # This is crucial for XOR problem
-        return x + 0.25 * jnp.tanh(x * 3.0) + 0.1 * jax.nn.sigmoid(x * 4.0) - 0.05
+            # Standard GELU, good for various tasks
+            return jax.nn.gelu(x)
+        # Default to a slightly enhanced tanh for unknown activations
+        return jnp.tanh(x * 1.2)
 
     def _sync_weights_with_genome(self):
         """Ensure all enabled connections in the genome have weights as float32."""
@@ -129,26 +118,14 @@ class Network:
     def forward_impl(self, weights: WeightsDict, x: jnp.ndarray) -> jnp.ndarray:
         self._sync_weights_with_genome()
 
-        # Create flag for debugging - only debug specific XOR corner cases
-        # Use numpy for debugging checks to avoid JAX tracing errors
-        debug_mode = False
-
-        # Only perform this check outside of JAX tracing
-        # Check if this is a JAX tracer object without directly accessing jax.core
-        is_jax_tracer = hasattr(x, "_trace") and hasattr(x, "aval")
-        if not is_jax_tracer and len(x) == 2:
-            # We need to convert this to a regular Python value to avoid JAX tracing issues
-            x_np = np.array(x)
-            # If input is close to one of the XOR corners
-            corners = [[-0.5, -0.5], [-0.5, 0.5], [0.5, -0.5], [0.5, 0.5]]
-            for corner in corners:
-                if abs(x_np[0] - corner[0]) < 0.3 and abs(x_np[1] - corner[1]) < 0.3:
-                    debug_mode = True
-                    break
-
         # Initialize node values
         node_values = {
-            node_id: jnp.array([0.0]) for node_id in self.genome.nodes.keys()
+            node_id: (
+                jnp.array([1.0])
+                if self.genome.nodes[node_id].type == "bias"
+                else jnp.array([0.0])
+            )
+            for node_id in self.genome.nodes.keys()
         }
 
         # Set input values
@@ -156,16 +133,8 @@ class Network:
         for i, node_id in enumerate(input_nodes):
             node_values[node_id] = jnp.array([x[i]])
 
-        if debug_mode:
-            print(f"\n--- DETAILED NETWORK TRACE for input {x} ---")
-            print(f"Input nodes: {input_nodes}")
-            print(f"Input values: {[node_values[n][0] for n in input_nodes]}")
-
         # Process nodes in topological order
         sorted_nodes = self._get_sorted_nodes()
-
-        if debug_mode:
-            print(f"Node processing order: {sorted_nodes}")
 
         for node_id in sorted_nodes:
             if node_id not in input_nodes:  # Skip input nodes
@@ -199,21 +168,31 @@ class Network:
         return jax.vmap(lambda xi: self.forward_impl(self.weights, xi))(x)
 
     def compute_loss(self, x: jnp.ndarray, y: jnp.ndarray) -> float:
-        """Compute MSE loss."""
-        predictions = jax.vmap(lambda x: self.forward(x))(x)
-        return float(jnp.mean((predictions - y) ** 2))
+        """Compute binary cross entropy loss."""
+        predictions = self.forward(x)
+        predictions = jnp.clip(predictions, 1e-7, 1.0 - 1e-7)
+        return float(
+            -jnp.mean(y * jnp.log(predictions) + (1 - y) * jnp.log(1 - predictions))
+        )
 
     def _update_learning_rate(self):
-        """Update learning rate using a simple decay schedule."""
-        # Decay learning rate every 100 epochs
-        if self.epoch % 100 == 0 and self.epoch > 0:
-            self.learning_rate = self.initial_learning_rate * (
-                0.5 ** (self.epoch // 100)
-            )
+        """Update learning rate using a cosine decay schedule with warm restarts."""
+        # Cosine annealing with warm restarts
+        cycle_length = 50  # Shorter cycles for more frequent restarts
+        min_lr = self.initial_learning_rate * 0.01
+        cycle = self.epoch // cycle_length
+        t = (self.epoch % cycle_length) / cycle_length
+        # Cosine decay with warm restarts
+        cos_decay = 0.5 * (1 + jnp.cos(jnp.pi * t))
+        # Add gradual decay across cycles
+        cycle_decay = 0.9**cycle
+        self.learning_rate = (
+            min_lr + (self.initial_learning_rate - min_lr) * cos_decay * cycle_decay
+        )
         self.epoch += 1
 
-    def train_step(self, x: jnp.ndarray, y: jnp.ndarray, use_bce: bool = True) -> float:
-        """Perform one training step using backpropagation."""
+    def train_step(self, x: jnp.ndarray, y: jnp.ndarray) -> float:
+        """Perform one training step using backpropagation with binary cross entropy loss."""
         self._sync_weights_with_genome()
         self._update_learning_rate()
 
@@ -222,17 +201,12 @@ class Network:
             weights: WeightsDict, x_batch: jnp.ndarray, y_batch: jnp.ndarray
         ) -> jnp.ndarray:
             predictions = jax.vmap(lambda x: self.forward_impl(weights, x))(x_batch)
-
-            if use_bce:
-                # Binary cross entropy for classification tasks
-                preds_clipped = jnp.clip(predictions, 1e-7, 1.0 - 1e-7)
-                return -jnp.mean(
-                    y_batch * jnp.log(preds_clipped)
-                    + (1 - y_batch) * jnp.log(1 - preds_clipped)
-                )
-            else:
-                # MSE loss for regression tasks
-                return jnp.mean((predictions - y_batch) ** 2)
+            # Binary cross entropy loss
+            preds_clipped = jnp.clip(predictions, 1e-7, 1.0 - 1e-7)
+            return -jnp.mean(
+                y_batch * jnp.log(preds_clipped)
+                + (1 - y_batch) * jnp.log(1 - preds_clipped)
+            )
 
         # Compute gradients
         loss_val, gradients = jax.value_and_grad(batch_loss)(self.weights, x, y)
@@ -285,14 +259,6 @@ class Network:
         # For XOR, use a cleaner threshold with some margin
         binary_output = (predictions >= threshold).astype(jnp.float32)
 
-        # If the input is small (for debugging), print inputs and outputs
-        if isinstance(x, np.ndarray) and len(x) <= 10:
-            print("\nDebug predict_binary:")
-            for i in range(len(x)):
-                print(
-                    f"Input: {x[i]}, Raw: {predictions[i][0]:.4f}, Binary: {binary_output[i][0]}"
-                )
-
         return binary_output
 
     def compute_binary_accuracy(
@@ -301,15 +267,6 @@ class Network:
         """Compute binary classification accuracy."""
         binary_preds = self.predict_binary(x, threshold)
         accuracy = float(jnp.mean((binary_preds == y).astype(jnp.float32)))
-
-        # For debugging XOR accuracy issues
-        if len(x) <= 20:  # Only for small test sets
-            raw_preds = self.forward(x)
-            print("Debug - Sample predictions:")
-            for i in range(min(5, len(x))):
-                print(
-                    f"  Input: {x[i]}, Expected: {y[i][0]:.1f}, Raw pred: {raw_preds[i][0]:.4f}, Binary: {binary_preds[i][0]:.1f}"
-                )
 
         return accuracy
 

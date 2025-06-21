@@ -1,18 +1,5 @@
-# macOS
-
+# Others
 .DS_Store
-
-# Python
-
-**pycache**/
-\*.pyc
-
-# Environment files
-
-.env
-.env.\*
-
-# IDEs and editors
-
-.vscode/
-.idea/
+__pycache__/
+venv/
+.venv/

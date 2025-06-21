@@ -112,12 +112,14 @@ class Genome:
         fitness: float = float("-inf"),
         adjusted_fitness: float = float("-inf"),
         saved_weights: Optional[Dict[Tuple[int, int], Union[float, NDArray]]] = None,
+        metrics: Optional[dict] = None,
     ):
         self.nodes = nodes
         self.connections = connections
         self.fitness = fitness
         self.adjusted_fitness = adjusted_fitness
         self.saved_weights = saved_weights
+        self.metrics = metrics if metrics is not None else {}
 
     def clone(self) -> "Genome":
         """Create a deep copy of the genome."""
@@ -134,6 +136,7 @@ class Genome:
             self.fitness,
             self.adjusted_fitness,
             self.saved_weights.copy() if self.saved_weights is not None else None,
+            self.metrics.copy() if self.metrics is not None else {},
         )
 
     def mutate(
@@ -146,41 +149,128 @@ class Genome:
         activation_rate: float = 0.2,
     ):
         """Apply mutation operators."""
-        # Mutate connection weights
-        for conn in self.connections.values():
-            if random.random() < weight_mutation_rate:
-                if random.random() < 0.9:  # 90% chance of small perturbation
-                    conn.weight += np.random.normal(0, weight_perturbation)
-                else:  # 10% chance of random weight
-                    conn.weight = np.random.normal(0, 1)
+        # --- PATCH: Prevent weight mutation if rate is 0 ---
+        if weight_mutation_rate == 0:
+            # Only toggle, activation, add node/connection
+            for conn in self.connections.values():
+                if random.random() < toggle_rate:
+                    conn.enabled = not conn.enabled
+        else:
+            # Mutate connection weights
+            for conn in self.connections.values():
+                if random.random() < weight_mutation_rate:
+                    if random.random() < 0.9:  # 90% chance of small perturbation
+                        conn.weight += np.random.normal(0, weight_perturbation)
+                    else:  # 10% chance of random weight
+                        conn.weight = np.random.normal(0, 1)
 
-            # Toggle connection
-            if random.random() < toggle_rate:
-                conn.enabled = not conn.enabled
+                # Toggle connection
+                if random.random() < toggle_rate:
+                    conn.enabled = not conn.enabled
 
         # Mutate activation functions
         for node in self.nodes.values():
             if node.type == "hidden" and random.random() < activation_rate:
                 node.activation = random.choice(
-                    [
-                        "relu",
-                        "sigmoid",
-                        "tanh",
-                        "leaky_relu",
-                        "elu",
-                        "softplus",
-                        "swish",
-                        "gelu",
-                    ]
+                    ["relu", "sigmoid", "tanh", "leaky_relu"]
                 )
 
         # Add new node
         if random.random() < add_node_rate:
-            self._mutate_add_node()
+            self.mutate_add_node()
 
         # Add new connection
         if random.random() < add_connection_rate:
-            self._mutate_add_connection()
+            self.mutate_add_connection()
+
+        # Validate after mutations
+        self.validate()
+
+    def mutate_add_node(self):
+        """Add a new node by splitting an existing connection."""
+        # Choose a random enabled connection
+        enabled_connections = [
+            c
+            for c in self.connections.values()
+            if c.enabled and c.in_node in self.nodes and c.out_node in self.nodes
+        ]
+        if not enabled_connections:
+            return False
+
+        # Prefer connections between input and output
+        io_connections = [
+            c
+            for c in enabled_connections
+            if self.nodes[c.in_node].type == "input"
+            and self.nodes[c.out_node].type == "output"
+        ]
+
+        if io_connections and random.random() < 0.6:
+            conn = random.choice(io_connections)
+        else:
+            conn = random.choice(enabled_connections)
+
+        conn.enabled = False
+
+        # Create new node with random activation
+        new_node_id = Genome.node_counter
+        activation_probs = {
+            "relu": 0.4,
+            "sigmoid": 0.3,
+            "tanh": 0.3,
+        }
+        activation = random.choices(
+            list(activation_probs.keys()), list(activation_probs.values())
+        )[0]
+        self.nodes[new_node_id] = NodeGene(new_node_id, "hidden", activation)
+        Genome.node_counter += 1
+
+        # Create new connections
+        input_scale = np.sqrt(2.0) if activation == "relu" else 1.0
+        w1 = np.random.normal(0, input_scale / np.sqrt(len(self.nodes)))
+        self.connections[(conn.in_node, new_node_id)] = ConnectionGene(
+            conn.in_node, new_node_id, w1, True, Genome.innovation_counter
+        )
+        Genome.innovation_counter += 1
+
+        w2 = conn.weight * np.sqrt(2.0)
+        self.connections[(new_node_id, conn.out_node)] = ConnectionGene(
+            new_node_id, conn.out_node, w2, True, Genome.innovation_counter
+        )
+        Genome.innovation_counter += 1
+        return True
+
+    def mutate_add_connection(self):
+        """Add a new connection between existing nodes."""
+        input_nodes = [n.id for n in self.nodes.values() if n.type == "input"]
+        hidden_nodes = [n.id for n in self.nodes.values() if n.type == "hidden"]
+        output_nodes = [n.id for n in self.nodes.values() if n.type == "output"]
+
+        if not input_nodes or not output_nodes:
+            return False
+
+        sources = input_nodes + hidden_nodes
+        targets = output_nodes if not hidden_nodes else (hidden_nodes + output_nodes)
+
+        if not sources or not targets:
+            return False  # Early return if empty
+
+        for _ in range(10):
+            in_node = random.choice(sources)
+            out_node = random.choice(targets)
+            if (in_node, out_node) in self.connections:
+                continue
+            if in_node == out_node:
+                continue
+            if self._would_create_cycle(in_node, out_node):
+                continue
+            weight = np.random.normal(0, 1)
+            self.connections[(in_node, out_node)] = ConnectionGene(
+                in_node, out_node, weight, True, Genome.innovation_counter
+            )
+            Genome.innovation_counter += 1
+            return True
+        return False
 
     def _mutate_add_node(self):
         """Add a new node by splitting an existing connection."""
@@ -301,7 +391,7 @@ class Genome:
                         else 1.0
                     )
                     weight = random.uniform(-limit, limit)
-                    genome.connections[(source.id, output.id)] = ConnectionGene(
+                    self.connections[(source.id, output.id)] = ConnectionGene(
                         source.id,
                         output.id,
                         weight,
@@ -439,39 +529,63 @@ class Genome:
         """Remove nodes and connections not on any path from input to output."""
         input_ids = [n.id for n in genome.nodes.values() if n.type == "input"]
         output_ids = [n.id for n in genome.nodes.values() if n.type == "output"]
-        # Build adjacency list for enabled connections
+
+        # Build forward adjacency list for enabled connections
         adj = {nid: [] for nid in genome.nodes}
+        rev_adj = {nid: [] for nid in genome.nodes}  # Reverse adjacency list
         for conn in genome.connections.values():
             if conn.enabled:
                 adj[conn.in_node].append(conn.out_node)
-        # Find all nodes reachable from any input
-        reachable = set()
-        stack = list(input_ids)
-        while stack:
-            nid = stack.pop()
-            if nid not in reachable:
-                reachable.add(nid)
-                stack.extend(adj[nid])
-        # Find all nodes that can reach any output (reverse graph)
-        rev_adj = {nid: [] for nid in genome.nodes}
-        for conn in genome.connections.values():
-            if conn.enabled:
                 rev_adj[conn.out_node].append(conn.in_node)
-        can_reach_output = set()
-        stack = list(output_ids)
-        while stack:
-            nid = stack.pop()
-            if nid not in can_reach_output:
-                can_reach_output.add(nid)
-                stack.extend(rev_adj[nid])
-        # Keep only nodes and connections that are both reachable from input and can reach output
-        valid_nodes = reachable & can_reach_output
+
+        # For each output node, find all nodes that are part of a valid input-output path
+        valid_nodes = set()
+        for out_id in output_ids:
+            # Do BFS from output node to find all nodes that can reach this output
+            can_reach_output = {out_id}
+            stack = [out_id]
+            while stack:
+                nid = stack.pop()
+                for prev_id in rev_adj[nid]:
+                    if prev_id not in can_reach_output:
+                        can_reach_output.add(prev_id)
+                        stack.append(prev_id)
+
+            # From those nodes, find which ones have a path from input
+            nodes_with_input_path = set()
+            stack = [n for n in input_ids if n in can_reach_output]
+            nodes_with_input_path.update(stack)
+            while stack:
+                nid = stack.pop()
+                for next_id in adj[nid]:
+                    if (
+                        next_id in can_reach_output
+                        and next_id not in nodes_with_input_path
+                    ):
+                        nodes_with_input_path.add(next_id)
+                        stack.append(next_id)
+
+            valid_nodes.update(nodes_with_input_path)
+
+        # Update genome with pruned nodes and connections
         genome.nodes = {nid: n for nid, n in genome.nodes.items() if nid in valid_nodes}
         genome.connections = {
             (c.in_node, c.out_node): c
             for (c_in, c_out), c in genome.connections.items()
             if c.enabled and c.in_node in valid_nodes and c.out_node in valid_nodes
         }
+
+    def validate(self) -> bool:
+        """Validate genome structure and clean up any invalid connections."""
+        valid = True
+        invalid_connections = []
+        for key, conn in self.connections.items():
+            if conn.in_node not in self.nodes or conn.out_node not in self.nodes:
+                invalid_connections.append(key)
+                valid = False
+        for key in invalid_connections:
+            del self.connections[key]
+        return valid
 
 
 @dataclass
@@ -705,13 +819,13 @@ class Population:
             )
 
             # After adding a new connection, ensure every output node has at least one incoming connection
-            output_nodes = [n for n in genome.nodes.values() if n.type == "output"]
-            input_nodes = [n for n in genome.nodes.values() if n.type == "input"]
-            hidden_nodes = [n for n in genome.nodes.values() if n.type == "hidden"]
+            output_nodes = [n for n in self.nodes.values() if n.type == "output"]
+            input_nodes = [n for n in self.nodes.values() if n.type == "input"]
+            hidden_nodes = [n for n in self.nodes.values() if n.type == "hidden"]
             for output in output_nodes:
                 incoming = [
                     conn
-                    for conn in genome.connections.values()
+                    for conn in self.connections.values()
                     if conn.out_node == output.id and conn.enabled
                 ]
                 if not incoming:
@@ -727,7 +841,7 @@ class Population:
                             else 1.0
                         )
                         weight = random.uniform(-limit, limit)
-                        genome.connections[(source.id, output.id)] = ConnectionGene(
+                        self.connections[(source.id, output.id)] = ConnectionGene(
                             source.id,
                             output.id,
                             weight,
@@ -760,8 +874,8 @@ class Population:
 
         for species in self.species:
             if (
-                species.staleness <= 15
-            ):  # Allow species to survive for up to 15 generations
+                species.staleness <= 5
+            ):  # Allow species to survive for up to 5 generations
                 # Calculate number of offspring
                 if total_adjusted_fitness > 0:
                     quota = max(
@@ -795,32 +909,70 @@ class Population:
         while len(new_population) < self.size:
             new_population.append(self._create_diverse_population(1)[0])
 
+        # --- FIX: Trim population to intended size ---
+        if len(new_population) > self.size:
+            new_population = new_population[: self.size]
+
         # Update population
         self.genomes = new_population
         self.generation += 1
 
     def _speciate(self):
-        """Divide population into species based on similarity."""
+        """Divide population into species based on similarity, enforcing minimum species size and population size."""
         # Clear current species
         self.species = []
-
+        min_species_size = max(2, getattr(self, "min_species_size", 2))
+        max_population = self.size
         # Try to add each genome to an existing species
         for genome in self.genomes:
             added = False
+            closest_species = None
+            closest_distance = float("inf")
             for species in self.species:
-                if (
-                    get_distance(genome, species.representative)
-                    < self.compatibility_threshold
-                ):
+                dist = get_distance(genome, species.representative)
+                if dist < self.compatibility_threshold:
                     species.members.append(genome)
                     added = True
                     break
-
+                if dist < closest_distance:
+                    closest_distance = dist
+                    closest_species = species
             # If no matching species found, create new one
             if not added:
-                self.species.append(
-                    Species(members=[genome], representative=genome, staleness=0)
-                )
+                if closest_species and len(closest_species.members) < min_species_size:
+                    closest_species.members.append(genome)
+                else:
+                    self.species.append(
+                        Species(members=[genome], representative=genome, staleness=0)
+                    )
+        # Merge small species if needed
+        merged_species = []
+        for species in self.species:
+            if len(species.members) < min_species_size and len(self.species) > 1:
+                # Merge with closest other species
+                other_species = [s for s in self.species if s is not species]
+                if other_species:
+                    closest = min(
+                        other_species,
+                        key=lambda s: get_distance(
+                            species.representative, s.representative
+                        ),
+                    )
+                    closest.members.extend(species.members)
+                else:
+                    merged_species.append(species)
+            else:
+                merged_species.append(species)
+        self.species = merged_species
+        # If population size has grown, trim excess genomes
+        all_members = [m for s in self.species for m in s.members]
+        if len(all_members) > max_population:
+            all_members = all_members[:max_population]
+            # Re-speciate trimmed population
+            self.genomes = all_members
+            self._speciate()
+        else:
+            self.genomes = all_members
 
     def _compute_adjusted_fitness(self):
         """Compute adjusted fitness using fitness sharing within species."""
@@ -1010,53 +1162,64 @@ class Population:
                             self.innovation_counter,
                         )
 
-    def _select_parent(self, tournament_size: int = 3):
-        """Select a parent genome using tournament selection."""
-        # Randomly select tournament_size genomes
-        candidates = random.sample(
-            self.genomes, min(tournament_size, len(self.genomes))
-        )
-        # Return the genome with the highest fitness
-        return max(candidates, key=lambda g: g.fitness)
+        # --- Maintain saved_weights for new/removed connections ---
+        if hasattr(genome, "saved_weights"):
+            if genome.saved_weights is None:
+                genome.saved_weights = {}
+            # Remove weights for deleted or disabled connections
+            genome.saved_weights = {
+                k: v
+                for k, v in genome.saved_weights.items()
+                if k in genome.connections and genome.connections[k].enabled
+            }
+            # Add weights for new enabled connections
+            for k, conn in genome.connections.items():
+                if conn.enabled and k not in genome.saved_weights:
+                    genome.saved_weights[k] = np.array(
+                        [float(conn.weight)], dtype=np.float32
+                    )
 
 
-def prune_nonfunctional(genome: Genome):
+def prune_nonfunctional(genome):
     """Remove nodes and connections not on any path from input to output.
-    This is critical for XOR networks to ensure all nodes contribute to the solution."""
+    This includes nodes that are connected but not part of any complete input-to-output path.
+    """
     input_ids = [n.id for n in genome.nodes.values() if n.type == "input"]
     output_ids = [n.id for n in genome.nodes.values() if n.type == "output"]
-    hidden_ids = [n.id for n in genome.nodes.values() if n.type == "hidden"]
 
-    # Build adjacency list for enabled connections
+    # Build forward adjacency list for enabled connections
     adj = {nid: [] for nid in genome.nodes}
+    rev_adj = {nid: [] for nid in genome.nodes}  # Reverse adjacency list
     for conn in genome.connections.values():
         if conn.enabled:
             adj[conn.in_node].append(conn.out_node)
-
-    # Find all nodes reachable from any input
-    reachable = set()
-    stack = list(input_ids)
-    while stack:
-        nid = stack.pop()
-        if nid not in reachable:
-            reachable.add(nid)
-            stack.extend(adj[nid])
-
-    # Find all nodes that can reach any output (reverse graph)
-    rev_adj = {nid: [] for nid in genome.nodes}
-    for conn in genome.connections.values():
-        if conn.enabled:
             rev_adj[conn.out_node].append(conn.in_node)
-    can_reach_output = set()
-    stack = list(output_ids)
-    while stack:
-        nid = stack.pop()
-        if nid not in can_reach_output:
-            can_reach_output.add(nid)
-            stack.extend(rev_adj[nid])
 
-    # Keep only nodes and connections that are both reachable from input and can reach output
-    valid_nodes = reachable & can_reach_output
+    # For each output node, find all nodes that are part of a valid input-output path
+    valid_nodes = set()
+    for out_id in output_ids:
+        # Do BFS from output node to find all nodes that can reach this output
+        can_reach_output = {out_id}
+        stack = [out_id]
+        while stack:
+            nid = stack.pop()
+            for prev_id in rev_adj[nid]:
+                if prev_id not in can_reach_output:
+                    can_reach_output.add(prev_id)
+                    stack.append(prev_id)
+
+        # From those nodes, find which ones have a path from input
+        nodes_with_input_path = set()
+        stack = [n for n in input_ids if n in can_reach_output]
+        nodes_with_input_path.update(stack)
+        while stack:
+            nid = stack.pop()
+            for next_id in adj[nid]:
+                if next_id in can_reach_output and next_id not in nodes_with_input_path:
+                    nodes_with_input_path.add(next_id)
+                    stack.append(next_id)
+
+        valid_nodes.update(nodes_with_input_path)
 
     # Update genome with pruned nodes and connections
     genome.nodes = {nid: n for nid, n in genome.nodes.items() if nid in valid_nodes}
@@ -1065,5 +1228,3 @@ def prune_nonfunctional(genome: Genome):
         for (c_in, c_out), c in genome.connections.items()
         if c.enabled and c.in_node in valid_nodes and c.out_node in valid_nodes
     }
-
-    return genome
