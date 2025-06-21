@@ -307,7 +307,7 @@ def main(
     for genome in population.genomes[2:]:  # Skip first two
         # Encourage more structural mutations for XOR
         genome.mutate(
-            weight_mutation_rate=0.85,
+            weight_mutation_rate=0.0,  # PATCH: Set to 0 to disable weight mutation
             add_node_rate=0.35,
             add_connection_rate=0.55,
         )
@@ -485,4 +485,4 @@ def main(
 
 if __name__ == "__main__":
     # Run with parallel processing for faster execution
-    main(task="two_circles", n_samples=3000, visualize=True, parallel=True)
+    main(task="spiral", n_samples=3000, visualize=True, parallel=True)
