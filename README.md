@@ -1,5 +1,7 @@
 # NEAT-Backprop: Neuroevolution with Backpropagation
 
+![xor_evolution.gif](xor_evolution.gif)
+
 This project implements a hybrid neuroevolution algorithm that combines NEAT (NeuroEvolution of Augmenting Topologies) with backpropagation for evolving neural networks on classic classification tasks. The system evolves both the topology and weights of neural networks, and further optimizes weights using gradient descent.
 
 ## Example Results

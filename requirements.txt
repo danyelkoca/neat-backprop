@@ -4,3 +4,7 @@ numpy==2.3.0
 matplotlib==3.10.3
 matplotlib
 networkx==3.5
+
+# For gif making
+imageio==2.37.0
+pillow==11.2.1
